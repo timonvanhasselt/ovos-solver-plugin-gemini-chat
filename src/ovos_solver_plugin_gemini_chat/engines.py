@@ -47,6 +47,8 @@ class GeminiCompletionsSolver(QuestionSolver):
         )
         self.api_key = self.config.get("api_key")
         self.reasoning = self.config.get("enable_reasoning", False)
+        self.grounding = self.config.get("enable_grounding", False)
+        
         if not self.api_key:
             LOG.error("'api_key' not set in config")
             raise ValueError("api key must be set")
@@ -72,14 +74,21 @@ class GeminiCompletionsSolver(QuestionSolver):
             LOG.warning(f"unable to select model: {e}")
             LOG.warning(f"trying to use whichever model was selected previously")
 
-        self.initial_prompt = config.get("initial_prompt", "You are a helpful assistant.")
+        self.initial_prompt = self.config.get("system_prompt") or self.config.get("initial_prompt", "You are a helpful assistant.")
+        
+        # Configure tools for grounding if enabled
+        tools = [types.Tool(google_search=types.GoogleSearch())] if self.grounding else None
+        
         self.content_config = types.GenerateContentConfig(
             thinking_config=types.ThinkingConfig(
                 thinking_budget=-1 if self.reasoning else 0
             ),
             system_instruction=self.initial_prompt,
+            tools=tools,
+            temperature=self.config.get("temperature"),
+            max_output_tokens=self.config.get("max_output_tokens")
         )
-        LOG.info(f"Using Gemini model: {self.model}")
+        LOG.info(f"Using Gemini model: {self.model} (Grounding: {self.grounding})")
 
     def _setup_client(self: GeminiCompletionsSolver) -> Client:
         """Authenticate user for a Hugging Chat session and retrieve cookie jar."""
@@ -96,6 +105,20 @@ class GeminiCompletionsSolver(QuestionSolver):
             config=self.content_config,
             contents=prompt,
         )
+        if response.candidates:
+            # Check for grounding metadata in direct response
+            meta = getattr(response.candidates[0], 'grounding_metadata', None)
+            if meta:
+                if meta.web_search_queries:
+                    LOG.debug(f"Gemini Zoekopdrachten: {meta.web_search_queries}")
+                
+                # Neat source citation without HTML
+                chunks = getattr(meta, 'grounding_chunks', [])
+                if chunks:
+                    for i, chunk in enumerate(chunks, 1):
+                        if chunk.web:
+                            LOG.debug(f"Bron {i}: {chunk.web.title} -> {chunk.web.uri}")
+                
         return response.text
 
     def _do_streaming_api_request(
@@ -108,9 +131,33 @@ class GeminiCompletionsSolver(QuestionSolver):
             config=self.content_config,
             contents=prompt,
         )
+        buffered_text = ""
+        grounding_detected = False
         for chunk in content_iterator:
+            if chunk.candidates:
+                meta = getattr(chunk.candidates[0], 'grounding_metadata', None)
+                if meta:
+                    if meta.web_search_queries:
+                        LOG.debug(f"Gemini Zoekopdrachten (Stream): {meta.web_search_queries}")
+                        grounding_detected = True
+                    
+                   # Log the sources neatly without HTML
+                    chunks = getattr(meta, 'grounding_chunks', [])
+                    if chunks:
+                        for i, c in enumerate(chunks, 1):
+                            if c.web:
+                                LOG.debug(f"Bron {i}: {c.web.title} -> {c.web.uri}")
+
             if chunk.text is not None:
-                yield post_process_sentence(chunk.text)
+                if not grounding_detected and self.grounding:
+                    buffered_text += chunk.text
+                else:
+                    if buffered_text:
+                        yield post_process_sentence(buffered_text)
+                        buffered_text = ""
+                    yield post_process_sentence(chunk.text)
+        if buffered_text:
+            yield post_process_sentence(buffered_text)
 
     def get_spoken_answer(
         self: GeminiCompletionsSolver,
@@ -146,6 +193,15 @@ class GeminiCompletionsSolver(QuestionSolver):
                 answer = next_chunk
             else:
                 answer += chunk
+        
+    # For a “nice ending”: pronounce the remainder when the stream stops
+        if answer.strip():
+            final_utt = ' '.join(answer.split()).strip()
+          # Always ensure there is a closing punctuation mark for TTS
+            if final_utt[-1] not in ENDING_CHARS:
+                final_utt += "."
+            LOG.debug(f"Gemini final phrase: {final_utt}")
+            yield final_utt
 
 
 class GeminiChatCompletionsSolver(ChatMessageSolver):
@@ -169,6 +225,8 @@ class GeminiChatCompletionsSolver(ChatMessageSolver):
         )
         self.api_key = self.config.get("api_key")
         self.reasoning = self.config.get("enable_reasoning", False)
+        self.grounding = self.config.get("enable_grounding", False)
+        
         if not self.api_key:
             LOG.error("'api_key' not set in config")
             raise ValueError("api key must be set")
@@ -194,27 +252,34 @@ class GeminiChatCompletionsSolver(ChatMessageSolver):
             LOG.warning(f"unable to select model: {e}")
             LOG.warning(f"trying to use whichever model was selected previously")
 
-        self.initial_prompt = config.get("initial_prompt", "You are a helpful assistant.")
-        self.content_config = types.GenerateContentConfig(
-            thinking_config=types.ThinkingConfig(
-                thinking_budget=-1 if self.reasoning else 0
-            ),
-            system_instruction=self.initial_prompt,
-        )
-        self.chat = self._setup_chat()
-        LOG.info(f"Using Gemini model: {self.model}")
-
-        self.memory = config.get("enable_memory", True)
-        self.max_utts = config.get("memory_size", 3)
-        self.qa_pairs = []  # tuple of q+a
         if "persona" in config:
             LOG.warning("'persona' config option is deprecated, use 'system_prompt' instead")
         if "initial_prompt" in config:
             LOG.warning("'initial_prompt' config option is deprecated, use 'system_prompt' instead")
-        self.system_prompt = config.get("system_prompt") or config.get("initial_prompt")
+        
+        self.system_prompt = self.config.get("system_prompt") or self.config.get("initial_prompt") or self.config.get("persona")
         if not self.system_prompt:
             self.system_prompt =  "You are a helpful assistant."
             LOG.error(f"system prompt not set in config! defaulting to '{self.system_prompt}'")
+
+        # Configure tools for grounding if enabled
+        tools = [types.Tool(google_search=types.GoogleSearch())] if self.grounding else None
+
+        self.content_config = types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(
+                thinking_budget=-1 if self.reasoning else 0
+            ),
+            system_instruction=self.system_prompt,
+            tools=tools,
+            temperature=self.config.get("temperature"),
+            max_output_tokens=self.config.get("max_output_tokens")
+        )
+        self.chat = self._setup_chat()
+        LOG.info(f"Using Gemini model: {self.model} (Grounding: {self.grounding})")
+
+        self.memory = config.get("enable_memory", True)
+        self.max_utts = config.get("memory_size", 3)
+        self.qa_pairs = []  # tuple of q+a
 
     def _setup_client(self: GeminiChatCompletionsSolver) -> Client:
         """Authenticate user for a Hugging Chat session and retrieve cookie jar."""
@@ -233,6 +298,19 @@ class GeminiChatCompletionsSolver(ChatMessageSolver):
     ) -> str | None:
         """Send query to Gemini"""
         response = self.chat.send_message(prompt)
+        if response.candidates:
+            meta = getattr(response.candidates[0], 'grounding_metadata', None)
+            if meta:
+                if meta.web_search_queries:
+                    LOG.debug(f"Gemini Zoekopdrachten: {meta.web_search_queries}")
+                
+               # Neat source citation without HTML
+                chunks = getattr(meta, 'grounding_chunks', [])
+                if chunks:
+                    for i, chunk in enumerate(chunks, 1):
+                        if chunk.web:
+                            LOG.debug(f"Bron {i}: {chunk.web.title} -> {chunk.web.uri}")
+                
         return response.text
 
     def _do_streaming_api_request(
@@ -240,9 +318,33 @@ class GeminiChatCompletionsSolver(ChatMessageSolver):
         prompt: str,
     ) -> Generator[str, None, None]:
         """Send query to Gemini"""
+        buffered_text = ""
+        grounding_detected = False
         for chunk in self.chat.send_message_stream(prompt):
+            if chunk.candidates:
+                meta = getattr(chunk.candidates[0], 'grounding_metadata', None)
+                if meta:
+                    if meta.web_search_queries:
+                        LOG.debug(f"Gemini Zoekopdrachten (Chat Stream): {meta.web_search_queries}")
+                        grounding_detected = True
+                    
+                   # Log the sources neatly without HTML
+                    chunks = getattr(meta, 'grounding_chunks', [])
+                    if chunks:
+                        for i, c in enumerate(chunks, 1):
+                            if c.web:
+                                LOG.debug(f"Bron {i}: {c.web.title} -> {c.web.uri}")
+
             if chunk.text is not None:
-                yield post_process_sentence(chunk.text)
+                if not grounding_detected and self.grounding:
+                    buffered_text += chunk.text
+                else:
+                    if buffered_text:
+                        yield post_process_sentence(buffered_text)
+                        buffered_text = ""
+                    yield post_process_sentence(chunk.text)
+        if buffered_text:
+            yield post_process_sentence(buffered_text)
 
     def get_chat_history(
         self: GeminiChatCompletionsSolver,
@@ -317,6 +419,14 @@ class GeminiChatCompletionsSolver(ChatMessageSolver):
                 answer = next_chunk
             else:
                 answer += chunk
+        
+        # For a “nice ending”: say the remainder when the stream stops
+        if answer.strip():
+            final_utt = ' '.join(answer.split()).strip()
+            if final_utt[-1] not in ENDING_CHARS:
+                final_utt += "."
+            LOG.debug(f"Gemini final phrase: {final_utt}")
+            yield final_utt
 
     def stream_utterances(
         self: GeminiChatCompletionsSolver,
