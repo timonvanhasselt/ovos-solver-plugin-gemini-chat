@@ -26,8 +26,11 @@ To use your own persona via the Gemini chat solver plugin, create a JSON file as
   ],
   "ovos-solver-plugin-gemini-chat": {
     "api_key": "your-gemini-api-key",
-    "system_prompt": "You are helping assistant who gives very short and factual answers in maximum twenty words and you don't use emojis",
-    "model": "gemini-2.5-flash"
+    "model": "gemini-2.5-flash-lite",
+    "system_prompt": "You are an assistant specializing in current information. IMPORTANT: ALWAYS consult Google Search before answering. Ignore your own memory for facts. Base your answer solely on the search results. Answer briefly and fluently in English.",
+    "enable_grounding": true,
+    "temperature": 0.1,
+    "max_output_tokens": 512
   }
 }
 ```
